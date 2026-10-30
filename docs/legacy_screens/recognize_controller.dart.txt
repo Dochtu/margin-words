@@ -1,0 +1,363 @@
+import 'package:flutter/foundation.dart';
+import 'package:image_picker/image_picker.dart';
+
+import '../core/app_config.dart';
+import '../data/word_draft.dart';
+import '../state/settings_store.dart';
+import '../state/word_store.dart';
+import 'agent_service.dart';
+import 'image_store.dart';
+import 'llm_service.dart';
+import 'local_word_parser.dart';
+import 'ocr_service.dart';
+import 'permission_service.dart';
+import 'phonetic_lookup.dart';
+import 'recognition_failure.dart';
+
+enum RecognizeStage {
+  idle,
+  picking,
+  ocr,
+  extracting,
+  phonetic,
+  done,
+  failed,
+  permissionDenied,
+}
+
+/// 拍照识别流程的状态机：选图 → 权限 → 本地 OCR → 大模型/本地解析 → 音标校验。
+class RecognizeController extends ChangeNotifier {
+  RecognizeController({
+    required OcrService ocr,
+    required LlmService llm,
+    required PermissionService permission,
+    required PhoneticLookup phonetic,
+    required SettingsStore settings,
+    required ImageStore imageStore,
+    required AgentService agent,
+    required WordStore words,
+  })  : _ocr = ocr,
+        _llm = llm,
+        _permission = permission,
+        _phonetic = phonetic,
+        _settings = settings,
+        _imageStore = imageStore,
+        _agent = agent,
+        _words = words;
+
+  final OcrService _ocr;
+  final LlmService _llm;
+  final PermissionService _permission;
+  final PhoneticLookup _phonetic;
+  final SettingsStore _settings;
+  final ImageStore _imageStore;
+  final AgentService _agent;
+  final WordStore _words;
+
+  RecognizeStage _stage = RecognizeStage.idle;
+  String? _imagePath;
+  String _ocrText = '';
+  List<WordDraft> _drafts = const <WordDraft>[];
+  RecognitionFailure? _failure;
+  String _instruction = '';
+  List<String> _notes = const <String>[];
+  PermissionOutcome? _permissionOutcome;
+  ImageSource? _pendingSource;
+  bool _disposed = false;
+
+  RecognizeStage get stage => _stage;
+  String? get imagePath => _imagePath;
+  String get ocrText => _ocrText;
+  List<WordDraft> get drafts => _drafts;
+  RecognitionFailure? get failure => _failure;
+  String get instruction => _instruction;
+
+  /// 本次筛选的过程说明（筛掉了几个、为什么没筛出来），确认页用一行展示
+  List<String> get notes => _notes;
+  PermissionOutcome? get permissionOutcome => _permissionOutcome;
+
+  /// 最近一次选择的图片来源（用于权限页判断是相机还是相册）
+  ImageSource? get pendingSource => _pendingSource;
+
+  bool get busy => _stage == RecognizeStage.picking ||
+      _stage == RecognizeStage.ocr ||
+      _stage == RecognizeStage.extracting ||
+      _stage == RecognizeStage.phonetic;
+
+  String get stageLabel {
+    switch (_stage) {
+      case RecognizeStage.picking:
+        return '正在获取图片…';
+      case RecognizeStage.ocr:
+        return '本地识别文字中…';
+      case RecognizeStage.extracting:
+        return AppConfig.llmReady || AppConfig.agentReady
+            ? '正在整理单词…'
+            : '本地规则提取中…';
+      case RecognizeStage.phonetic:
+        return '校验音标…';
+      case RecognizeStage.done:
+        return '识别完成';
+      case RecognizeStage.failed:
+        return '识别失败';
+      case RecognizeStage.permissionDenied:
+        return '需要权限';
+      case RecognizeStage.idle:
+        return '';
+    }
+  }
+
+  double get progress {
+    switch (_stage) {
+      case RecognizeStage.picking:
+        return 0.15;
+      case RecognizeStage.ocr:
+        return 0.42;
+      case RecognizeStage.extracting:
+        return 0.72;
+      case RecognizeStage.phonetic:
+        return 0.9;
+      case RecognizeStage.done:
+        return 1;
+      default:
+        return 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+
+  void _notify() {
+    if (!_disposed) notifyListeners();
+  }
+
+  void reset() {
+    _stage = RecognizeStage.idle;
+    _imagePath = null;
+    _ocrText = '';
+    _drafts = const <WordDraft>[];
+    _failure = null;
+    _notes = const <String>[];
+    _permissionOutcome = null;
+    _pendingSource = null;
+    _notify();
+  }
+
+  /// 用户点了「拍照」或「从相册选择」。
+  Future<void> pick(ImageSource source) async {
+    _pendingSource = source;
+    _failure = null;
+    _permissionOutcome = null;
+    _stage = RecognizeStage.picking;
+    _notify();
+
+    final PermissionOutcome outcome = source == ImageSource.camera
+        ? await _permission.ensureCamera()
+        : await _permission.ensureGallery();
+
+    if (outcome != PermissionOutcome.granted) {
+      _permissionOutcome = outcome;
+      _stage = RecognizeStage.permissionDenied;
+      _notify();
+      return;
+    }
+
+    await _openPicker(source);
+  }
+
+  /// 权限被拒后用户仍然选择继续（相册选择器在 Android 13+ 无需权限）。
+  Future<void> continueWithoutPermission() async {
+    final ImageSource? source = _pendingSource;
+    if (source == null) return;
+    _stage = RecognizeStage.picking;
+    _notify();
+    await _openPicker(source);
+  }
+
+  Future<void> requestPermissionAgain() async {
+    final ImageSource? source = _pendingSource;
+    if (source == null) return;
+    await pick(source);
+  }
+
+  Future<void> openAppSettings() => _permission.openSettings();
+
+  Future<void> _openPicker(ImageSource source) async {
+    XFile? file;
+    try {
+      file = await ImagePicker().pickImage(
+        source: source,
+        maxWidth: 2400,
+        maxHeight: 2400,
+        imageQuality: 90,
+        preferredCameraDevice: CameraDevice.rear,
+      );
+    } catch (e) {
+      _failure = RecognitionFailure(
+        FailureKind.unknown,
+        source == ImageSource.camera ? '无法打开相机' : '无法打开相册',
+        detail: e.toString(),
+      );
+      _stage = RecognizeStage.failed;
+      _notify();
+      return;
+    }
+
+    if (file == null) {
+      // 用户取消了选择，安静回到初始态
+      _stage = RecognizeStage.idle;
+      _notify();
+      return;
+    }
+
+    _imagePath = file.path;
+    _stage = RecognizeStage.ocr;
+    _notify();
+
+    try {
+      _ocrText = await _ocr.recognize(file.path);
+    } on RecognitionFailure catch (f) {
+      _failure = f;
+      _stage = RecognizeStage.failed;
+      _notify();
+      return;
+    }
+
+    await _extract();
+  }
+
+  /// 只重新跑「提取」这一步（OCR 文本已存在）。
+  Future<void> retryExtraction() async {
+    if (_ocrText.trim().isEmpty) {
+      _stage = RecognizeStage.idle;
+      _notify();
+      return;
+    }
+    await _extract();
+  }
+
+  /// 用户主动选择「本地规则识别」。
+  Future<void> fallbackToLocal() async {
+    if (_ocrText.trim().isEmpty) return;
+    _stage = RecognizeStage.extracting;
+    _failure = null;
+    _notify();
+    try {
+      _drafts = LocalWordParser.parse(_ocrText);
+      _notes = const <String>['已改用本地规则识别'];
+      await _validatePhonetic();
+      _stage = RecognizeStage.done;
+      _notify();
+    } on RecognitionFailure catch (f) {
+      _failure = f;
+      _stage = RecognizeStage.failed;
+      _notify();
+    }
+  }
+
+  /// 设置本次的筛选要求（例如"只保留名词""只提取我画圈的单词"）
+  void setInstruction(String value) {
+    if (_instruction == value) return;
+    _instruction = value;
+  }
+
+  Future<void> _extract() async {
+    _stage = RecognizeStage.extracting;
+    _failure = null;
+    _notes = const <String>[];
+    _notify();
+
+    try {
+      bool handled = false;
+
+      // ① 优先走智能体服务（LangGraph）：能理解自然语言筛选要求
+      if (AppConfig.agentReady) {
+        // 已掌握单词作为上下文，让「只保留我不认识的」有据可依
+        final List<String> knownWords = await _words.masteredWordList();
+        try {
+          final AgentResult result = await _agent.extract(
+            ocrText: _ocrText,
+            instruction: _instruction,
+            config: AgentConfig(baseUrl: AppConfig.agentBaseUrl),
+            allowVision: _settings.agentAllowVision,
+            imagePath: _imagePath,
+            knownWords: knownWords,
+          );
+          _drafts = result.words;
+          _notes = result.notes;
+          handled = true;
+        } on RecognitionFailure catch (f) {
+          // 智能体不可用：降级到直连大模型 / 本地规则，并如实说明
+          _notes = <String>[
+            '智能体未响应（${f.message}），已改用'
+            '${AppConfig.llmReady ? "大模型" : "本地规则"}识别',
+          ];
+        }
+      }
+
+      // ② 智能体不可用 / 未配置 / 地址填错：直连大模型，或本地规则
+      if (!handled) {
+        if (AppConfig.llmReady) {
+          _drafts = await _llm.extract(
+            ocrText: _ocrText,
+            config: LlmConfig(
+              baseUrl: AppConfig.llmBaseUrl,
+              apiKey: AppConfig.llmApiKey,
+              model: AppConfig.llmModel,
+              timeoutSeconds: AppConfig.llmTimeoutSeconds,
+            ),
+          );
+        } else {
+          _drafts = LocalWordParser.parse(_ocrText);
+        }
+        if (_instruction.trim().isNotEmpty) {
+          _drafts = _applyLocalInstruction(_drafts);
+        }
+      }
+
+      await _validatePhonetic();
+      _stage = RecognizeStage.done;
+      _notify();
+    } on RecognitionFailure catch (f) {
+      _failure = f;
+      _stage = RecognizeStage.failed;
+      _notify();
+    } catch (e) {
+      _failure = RecognitionFailure(FailureKind.unknown, '识别过程出错', detail: '$e');
+      _stage = RecognizeStage.failed;
+      _notify();
+    }
+  }
+
+  /// 没有智能体时的粗过滤兜底（只处理能靠规则判断的要求）
+  List<WordDraft> _applyLocalInstruction(List<WordDraft> input) {
+    if (_instruction.trim().isEmpty) return input;
+    final List<WordDraft> filtered = localInstructionFilter(input, _instruction);
+    return filtered.isEmpty ? input : filtered;
+  }
+
+  Future<void> _validatePhonetic() async {
+    if (_drafts.isEmpty) return;
+    _stage = RecognizeStage.phonetic;
+    _notify();
+    try {
+      await _phonetic.fillMissing(
+        _drafts,
+        allowNetwork: _settings.validatePhoneticOnline,
+      );
+    } catch (_) {
+      // 音标补全失败不影响主流程
+    }
+  }
+
+  /// 保存时按设置决定是否保留原图。
+  Future<String?> persistImageIfNeeded() async {
+    if (!_settings.saveSourceImage) return null;
+    final String? path = _imagePath;
+    if (path == null) return null;
+    return _imageStore.persist(path);
+  }
+}

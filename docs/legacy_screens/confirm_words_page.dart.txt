@@ -1,0 +1,447 @@
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import '../../core/word_text.dart';
+import '../../data/word_draft.dart';
+import '../../services/phonetic_lookup.dart';
+import '../../state/settings_store.dart';
+import '../../state/word_store.dart';
+import '../widgets/app_card.dart';
+
+/// 识别结果确认页：可改、可删、可合并重复，确认后才写库。
+class ConfirmWordsPage extends StatefulWidget {
+  const ConfirmWordsPage({
+    super.key,
+    required this.drafts,
+    this.notes = const <String>[],
+    this.resolveImagePath,
+  });
+
+  final List<WordDraft> drafts;
+
+  /// 筛选过程的一句话说明（筛掉了几个、为什么没筛出来），没有就不显示
+  final List<String> notes;
+  final Future<String?> Function()? resolveImagePath;
+
+  @override
+  State<ConfirmWordsPage> createState() => _ConfirmWordsPageState();
+}
+
+class _ConfirmWordsPageState extends State<ConfirmWordsPage> {
+  late final List<_DraftRow> _rows;
+  bool _saving = false;
+  bool _checkingPhonetic = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _rows = widget.drafts.map(_DraftRow.new).toList();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _markExisting());
+  }
+
+  @override
+  void dispose() {
+    for (final _DraftRow row in _rows) {
+      row.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _markExisting() async {
+    if (!mounted) return;
+    final Set<String> keys = await context
+        .read<WordStore>()
+        .existingKeys(_rows.map((_DraftRow r) => r.wordCtrl.text));
+    if (!mounted) return;
+    setState(() {
+      for (final _DraftRow row in _rows) {
+        row.exists = keys.contains(WordText.keyOf(row.wordCtrl.text));
+      }
+    });
+  }
+
+  int get _selectedCount =>
+      _rows.where((_DraftRow r) => r.draft.selected).length;
+
+  void _toggleAll(bool? value) {
+    setState(() {
+      for (final _DraftRow row in _rows) {
+        row.draft.selected = value ?? true;
+      }
+    });
+  }
+
+  void _removeRow(_DraftRow row) {
+    setState(() => _rows.remove(row));
+    WidgetsBinding.instance.addPostFrameCallback((_) => row.dispose());
+  }
+
+  void _mergeDuplicates() {
+    final Map<String, _DraftRow> kept = <String, _DraftRow>{};
+    final List<_DraftRow> removed = <_DraftRow>[];
+
+    for (final _DraftRow row in _rows) {
+      final String key = WordText.keyOf(row.wordCtrl.text);
+      if (key.isEmpty) continue;
+      final _DraftRow? existing = kept[key];
+      if (existing == null) {
+        kept[key] = row;
+        continue;
+      }
+      final String a = existing.meaningCtrl.text.trim();
+      final String b = row.meaningCtrl.text.trim();
+      if (b.isNotEmpty && !a.contains(b)) {
+        existing.meaningCtrl.text = a.isEmpty ? b : '$a；$b';
+      }
+      if (existing.phoneticCtrl.text.trim().isEmpty) {
+        existing.phoneticCtrl.text = row.phoneticCtrl.text;
+      }
+      existing.draft.selected = existing.draft.selected || row.draft.selected;
+      removed.add(row);
+    }
+
+    if (removed.isEmpty) {
+      _toast('没有发现重复单词');
+      return;
+    }
+    setState(() {
+      _rows.removeWhere(removed.contains);
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      for (final _DraftRow row in removed) {
+        row.dispose();
+      }
+    });
+    _toast('已合并 ${removed.length} 条重复单词');
+    _markExisting();
+  }
+
+  Future<void> _validatePhonetic() async {
+    if (_checkingPhonetic) return;
+    setState(() => _checkingPhonetic = true);
+    try {
+      final PhoneticLookup lookup = context.read<PhoneticLookup>();
+      final bool allowNetwork =
+          context.read<SettingsStore>().validatePhoneticOnline;
+      final List<WordDraft> drafts =
+          _rows.map((_DraftRow r) => r.snapshot()).toList();
+      final int filled = await lookup.fillMissing(
+        drafts,
+        allowNetwork: allowNetwork,
+      );
+      if (!mounted) return;
+      setState(() {
+        for (int i = 0; i < _rows.length; i++) {
+          if (drafts[i].phonetic.isNotEmpty) {
+            _rows[i].phoneticCtrl.text = drafts[i].phonetic;
+          }
+        }
+      });
+      _toast(filled > 0 ? '已补全 $filled 个音标' : '没有查询到新的音标');
+    } finally {
+      if (mounted) setState(() => _checkingPhonetic = false);
+    }
+  }
+
+  Future<void> _save() async {
+    final List<_DraftRow> selected =
+        _rows.where((_DraftRow r) => r.draft.selected).toList();
+    if (selected.isEmpty) {
+      _toast('请至少保留一个单词');
+      return;
+    }
+    for (final _DraftRow row in selected) {
+      if (WordText.cleanWord(row.wordCtrl.text).isEmpty) {
+        _toast('「${row.wordCtrl.text}」不是有效的英文单词');
+        return;
+      }
+    }
+
+    setState(() => _saving = true);
+    try {
+      final String? imagePath = await widget.resolveImagePath?.call();
+      final List<WordDraft> drafts = selected.map((_DraftRow r) {
+        final WordDraft d = r.snapshot();
+        d.selected = true;
+        d.imagePath = imagePath;
+        return d;
+      }).toList();
+
+      final SaveReport report = await context
+          .read<WordStore>()
+          .saveDrafts(drafts, imagePath: imagePath);
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(report.summary),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+      Navigator.of(context).pop(report);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _saving = false);
+      _toast('保存失败：$e');
+    }
+  }
+
+  void _toast(String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(content: Text(message), duration: const Duration(seconds: 2)),
+      );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('确认单词（${_rows.length}）'),
+        actions: <Widget>[
+          TextButton(
+            onPressed: _rows.isEmpty ? null : _mergeDuplicates,
+            child: const Text('合并重复', style: TextStyle(fontSize: 13)),
+          ),
+        ],
+      ),
+      body: Column(
+        children: <Widget>[
+          if (widget.notes.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 2),
+              child: Text(
+                widget.notes.join('；'),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  height: 1.5,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 2, 8, 4),
+            child: Row(
+              children: <Widget>[
+                Checkbox(
+                  value: _selectedCount == _rows.length && _rows.isNotEmpty,
+                  onChanged: _toggleAll,
+                  visualDensity: VisualDensity.compact,
+                ),
+                Text(
+                  '已选 $_selectedCount / ${_rows.length}',
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                ),
+                const Spacer(),
+                TextButton.icon(
+                  onPressed: _checkingPhonetic ? null : _validatePhonetic,
+                  icon: _checkingPhonetic
+                      ? const SizedBox(
+                          width: 13,
+                          height: 13,
+                          child: CircularProgressIndicator(strokeWidth: 1.8),
+                        )
+                      : const Icon(Icons.spellcheck_rounded, size: 16),
+                  label: const Text('校验音标', style: TextStyle(fontSize: 12.5)),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: _rows.isEmpty
+                ? Center(
+                    child: Text(
+                      '没有可保存的单词',
+                      style: TextStyle(color: scheme.onSurfaceVariant),
+                    ),
+                  )
+                : ListView.separated(
+                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+                    itemCount: _rows.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 10),
+                    itemBuilder: (BuildContext context, int index) {
+                      final _DraftRow row = _rows[index];
+                      return _DraftCard(
+                        row: row,
+                        onChanged: () => setState(() {}),
+                        onRemove: () => _removeRow(row),
+                      );
+                    },
+                  ),
+          ),
+          SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+              child: FilledButton(
+                onPressed: _saving ? null : _save,
+                child: _saving
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text('保存 $_selectedCount 个单词'),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DraftCard extends StatelessWidget {
+  const _DraftCard({
+    required this.row,
+    required this.onChanged,
+    required this.onRemove,
+  });
+
+  final _DraftRow row;
+  final VoidCallback onChanged;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+
+    return AppCard(
+      padding: const EdgeInsets.fromLTRB(12, 10, 8, 12),
+      color: row.draft.selected
+          ? null
+          : scheme.surfaceContainerHighest.withValues(alpha: 0.35),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Checkbox(
+                value: row.draft.selected,
+                onChanged: (bool? v) {
+                  row.draft.selected = v ?? false;
+                  onChanged();
+                },
+                visualDensity: VisualDensity.compact,
+              ),
+              Expanded(
+                child: TextField(
+                  controller: row.wordCtrl,
+                  onChanged: (_) => onChanged(),
+                  style: const TextStyle(
+                    fontSize: 15.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                  decoration: const InputDecoration(
+                    hintText: '英文单词',
+                    isDense: true,
+                    contentPadding:
+                        EdgeInsets.symmetric(horizontal: 10, vertical: 11),
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: '删除这一条',
+                onPressed: onRemove,
+                visualDensity: VisualDensity.compact,
+                icon: Icon(
+                  Icons.close_rounded,
+                  size: 18,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: <Widget>[
+              SizedBox(
+                width: 132,
+                child: TextField(
+                  controller: row.phoneticCtrl,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                  decoration: const InputDecoration(
+                    hintText: '音标（可空）',
+                    isDense: true,
+                    contentPadding:
+                        EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              if (row.exists)
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: scheme.primary.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(5),
+                  ),
+                  child: Text(
+                    '库中已有',
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w600,
+                      color: scheme.primary,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: row.meaningCtrl,
+            minLines: 1,
+            maxLines: 4,
+            style: const TextStyle(fontSize: 13.5, height: 1.5),
+            decoration: const InputDecoration(
+              hintText: '中文释义',
+              isDense: true,
+              contentPadding:
+                  EdgeInsets.symmetric(horizontal: 10, vertical: 11),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DraftRow {
+  _DraftRow(this.draft)
+      : wordCtrl = TextEditingController(text: draft.word),
+        phoneticCtrl = TextEditingController(text: draft.phonetic),
+        meaningCtrl = TextEditingController(text: draft.meaning);
+
+  final WordDraft draft;
+  final TextEditingController wordCtrl;
+  final TextEditingController phoneticCtrl;
+  final TextEditingController meaningCtrl;
+  bool exists = false;
+
+  WordDraft snapshot() {
+    final WordDraft copy = draft.copy();
+    copy
+      ..word = wordCtrl.text.trim()
+      ..phonetic = phoneticCtrl.text.trim()
+      ..meaning = meaningCtrl.text.trim();
+    return copy;
+  }
+
+  void dispose() {
+    wordCtrl.dispose();
+    phoneticCtrl.dispose();
+    meaningCtrl.dispose();
+  }
+}

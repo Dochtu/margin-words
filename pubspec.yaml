@@ -1,0 +1,41 @@
+name: wordbook
+description: "个人错题单词本 —— 拍照识别、每日回顾、全程离线存储（仅 Android）"
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.12.0 <4.0.0"
+  flutter: ">=3.44.0"
+
+# 说明：全部依赖使用「精确版本号」，避免 Android Studio 同步时解析到不兼容的版本。
+dependencies:
+  flutter:
+    sdk: flutter
+  # 中文本地化（日期选择器等系统组件的中文文案）
+  flutter_localizations:
+    sdk: flutter
+
+  # 本地数据库（SQLite，无需任何 Android 原生配置）
+  sqflite: 2.4.5
+  # 应用私有目录（保存可选的原图副本）
+  path_provider: 2.1.6
+  # 轻量键值存储（设置项）
+  shared_preferences: 2.5.6
+  # 拍照 / 相册选图
+  image_picker: 1.2.4
+  # 本地离线 OCR（Google ML Kit 文字识别，拉丁字母）
+  google_mlkit_text_recognition: 0.17.1
+  # 运行时权限 + 跳转系统设置
+  permission_handler: 12.0.1
+  # 调用大模型 HTTP 接口
+  http: 1.6.0
+  # 状态管理
+  provider: 6.1.5+1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: 6.0.0
+
+flutter:
+  uses-material-design: true

@@ -1,0 +1,390 @@
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:provider/provider.dart';
+
+import '../../core/app_theme.dart';
+import '../../data/word_draft.dart';
+import '../../services/agent_service.dart';
+import '../../services/image_store.dart';
+import '../../services/llm_service.dart';
+import '../../services/ocr_service.dart';
+import '../../services/permission_service.dart';
+import '../../services/phonetic_lookup.dart';
+import '../../services/recognize_controller.dart';
+import '../../services/recognition_failure.dart';
+import '../../state/settings_store.dart';
+import '../../state/word_store.dart';
+import '../widgets/app_card.dart';
+import '../widgets/state_views.dart';
+import 'confirm_words_page.dart';
+
+/// 拍照识别：拍照 / 选图 → 本地 OCR → 大模型（或本地规则）提取 → 确认页。
+///
+/// 界面只保留动作本身：没有隐私说明、没有配置入口、没有任何提示文案。
+/// 模型与智能体的参数全部写在 `lib/core/app_config.dart`。
+class RecognizePage extends StatefulWidget {
+  const RecognizePage({super.key});
+
+  @override
+  State<RecognizePage> createState() => _RecognizePageState();
+}
+
+class _RecognizePageState extends State<RecognizePage> {
+  late final RecognizeController _controller;
+  late final TextEditingController _instructionCtrl;
+  bool _navigating = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = RecognizeController(
+      ocr: context.read<OcrService>(),
+      llm: LlmService(),
+      permission: const PermissionService(),
+      phonetic: context.read<PhoneticLookup>(),
+      settings: context.read<SettingsStore>(),
+      imageStore: const ImageStore(),
+      agent: AgentService(),
+      words: context.read<WordStore>(),
+    );
+    _instructionCtrl = TextEditingController();
+  }
+
+  @override
+  void dispose() {
+    _instructionCtrl.dispose();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pick(ImageSource source) async {
+    await _controller.pick(source);
+    await _maybeOpenConfirm();
+  }
+
+  Future<void> _retry() async {
+    final RecognitionFailure? failure = _controller.failure;
+    if (failure != null && failure.needRepick) {
+      _controller.reset();
+      return;
+    }
+    await _controller.retryExtraction();
+    await _maybeOpenConfirm();
+  }
+
+  Future<void> _useLocal() async {
+    await _controller.fallbackToLocal();
+    await _maybeOpenConfirm();
+  }
+
+  Future<void> _maybeOpenConfirm() async {
+    if (!mounted || _navigating) return;
+    if (_controller.stage != RecognizeStage.done) return;
+
+    _navigating = true;
+    final SaveReport? report = await Navigator.of(context).push<SaveReport>(
+      MaterialPageRoute<SaveReport>(
+        builder: (_) => ConfirmWordsPage(
+          drafts: _controller.drafts,
+          notes: _controller.notes,
+          resolveImagePath: _controller.persistImageIfNeeded,
+        ),
+      ),
+    );
+    _navigating = false;
+    if (!mounted) return;
+
+    if (report != null) {
+      Navigator.of(context).pop(true);
+    } else {
+      _controller.reset();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('拍照识别')),
+      body: AnimatedBuilder(
+        animation: _controller,
+        builder: (BuildContext context, _) {
+          switch (_controller.stage) {
+            case RecognizeStage.idle:
+              return _IdleView(
+                instructionController: _instructionCtrl,
+                onInstructionChanged: _controller.setInstruction,
+                onCamera: () => _pick(ImageSource.camera),
+                onGallery: () => _pick(ImageSource.gallery),
+              );
+            case RecognizeStage.picking:
+            case RecognizeStage.ocr:
+            case RecognizeStage.extracting:
+            case RecognizeStage.phonetic:
+              return _ProcessingView(
+                imagePath: _controller.imagePath,
+                label: _controller.stageLabel,
+                progress: _controller.progress,
+              );
+            case RecognizeStage.failed:
+              return _FailureView(
+                failure: _controller.failure!,
+                onRetry: _retry,
+                onUseLocal: _controller.failure!.canUseLocal ? _useLocal : null,
+                onRepick: () => _controller.reset(),
+              );
+            case RecognizeStage.permissionDenied:
+              return _PermissionView(
+                outcome: _controller.permissionOutcome,
+                isCamera: _controller.pendingSource == ImageSource.camera,
+                onOpenSettings: () async {
+                  await _controller.openAppSettings();
+                },
+                onRetry: _controller.requestPermissionAgain,
+                onContinue: _controller.continueWithoutPermission,
+              );
+            case RecognizeStage.done:
+              return const Center(child: CircularProgressIndicator(strokeWidth: 2.4));
+          }
+        },
+      ),
+    );
+  }
+}
+
+class _IdleView extends StatelessWidget {
+  const _IdleView({
+    required this.instructionController,
+    required this.onInstructionChanged,
+    required this.onCamera,
+    required this.onGallery,
+  });
+
+  final TextEditingController instructionController;
+  final ValueChanged<String> onInstructionChanged;
+  final VoidCallback onCamera;
+  final VoidCallback onGallery;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 32),
+      children: <Widget>[
+        _CameraCard(onTap: onCamera),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: onGallery,
+            icon: const Icon(Icons.photo_library_outlined, size: 18),
+            label: const Text('从相册选择'),
+            style: OutlinedButton.styleFrom(minimumSize: const Size(0, 52)),
+          ),
+        ),
+        const SizedBox(height: 22),
+        TextField(
+          controller: instructionController,
+          onChanged: onInstructionChanged,
+          style: const TextStyle(fontSize: 13.5),
+          decoration: const InputDecoration(
+            labelText: '筛选要求',
+            isDense: true,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// 主操作：整块可点的拍照卡片。
+class _CameraCard extends StatelessWidget {
+  const _CameraCard({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+
+    return AppCard(
+      onTap: onTap,
+      padding: const EdgeInsets.symmetric(vertical: 40),
+      color: Color.alphaBlend(
+        scheme.primary.withValues(alpha: 0.06),
+        Theme.of(context).cardColor,
+      ),
+      child: Column(
+        children: <Widget>[
+          Container(
+            width: 62,
+            height: 62,
+            decoration: BoxDecoration(
+              color: scheme.primary.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(AppTheme.radiusLg),
+            ),
+            child: Icon(Icons.photo_camera_outlined, size: 29, color: scheme.primary),
+          ),
+          const SizedBox(height: 16),
+          const Text(
+            '拍照',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ProcessingView extends StatelessWidget {
+  const _ProcessingView({
+    required this.imagePath,
+    required this.label,
+    required this.progress,
+  });
+
+  final String? imagePath;
+  final String label;
+  final double progress;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+      child: Column(
+        children: <Widget>[
+          if (imagePath != null)
+            Expanded(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(AppTheme.radiusLg),
+                child: Image.file(
+                  File(imagePath!),
+                  fit: BoxFit.contain,
+                  width: double.infinity,
+                  errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                ),
+              ),
+            )
+          else
+            const Spacer(),
+          const SizedBox(height: 20),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: 5,
+              backgroundColor: scheme.onSurface.withValues(alpha: 0.06),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            label,
+            style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    );
+  }
+}
+
+class _FailureView extends StatelessWidget {
+  const _FailureView({
+    required this.failure,
+    required this.onRetry,
+    required this.onUseLocal,
+    required this.onRepick,
+  });
+
+  final RecognitionFailure failure;
+  final VoidCallback onRetry;
+  final VoidCallback? onUseLocal;
+  final VoidCallback onRepick;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final bool needRepick = failure.needRepick;
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(24, 28, 24, 32),
+      children: <Widget>[
+        StateView(
+          icon: Icons.error_outline_rounded,
+          title: failure.title,
+          message: failure.message,
+          iconColor: scheme.error,
+          compact: true,
+        ),
+        const SizedBox(height: 10),
+        if (onUseLocal != null) ...<Widget>[
+          FilledButton.icon(
+            onPressed: onUseLocal,
+            icon: const Icon(Icons.bolt_outlined, size: 18),
+            label: const Text('改用本地识别'),
+          ),
+          const SizedBox(height: 10),
+        ],
+        if (!needRepick) ...<Widget>[
+          OutlinedButton.icon(
+            onPressed: onRetry,
+            icon: const Icon(Icons.refresh_rounded, size: 18),
+            label: const Text('重试'),
+          ),
+          const SizedBox(height: 10),
+        ],
+        OutlinedButton.icon(
+          onPressed: onRepick,
+          icon: const Icon(Icons.photo_camera_outlined, size: 18),
+          label: const Text('重新选择图片'),
+        ),
+      ],
+    );
+  }
+}
+
+class _PermissionView extends StatelessWidget {
+  const _PermissionView({
+    required this.outcome,
+    required this.isCamera,
+    required this.onOpenSettings,
+    required this.onRetry,
+    required this.onContinue,
+  });
+
+  final PermissionOutcome? outcome;
+  final bool isCamera;
+  final VoidCallback onOpenSettings;
+  final VoidCallback onRetry;
+  final VoidCallback onContinue;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool permanent = outcome == PermissionOutcome.permanentlyDenied;
+
+    return StateView(
+      icon: isCamera ? Icons.photo_camera_outlined : Icons.photo_library_outlined,
+      title: isCamera ? '需要相机权限' : '需要相册权限',
+      action: FilledButton(
+        onPressed: onOpenSettings,
+        child: const Text('去系统设置'),
+      ),
+      secondaryAction: Column(
+        children: <Widget>[
+          if (!permanent)
+            TextButton(
+              onPressed: onRetry,
+              child: const Text('重新授权'),
+            ),
+          if (!isCamera && !permanent)
+            TextButton(
+              onPressed: onContinue,
+              child: const Text('直接选择图片'),
+            ),
+        ],
+      ),
+    );
+  }
+}
